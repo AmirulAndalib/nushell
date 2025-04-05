@@ -3,12 +3,13 @@ use std::sync::Arc;
 use crate::{span_to_range, uri_to_path, LanguageServer};
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionParams,
-    CompletionResponse, CompletionTextEdit, Documentation, MarkupContent, MarkupKind, TextEdit,
+    CompletionResponse, CompletionTextEdit, Documentation, InsertTextFormat, MarkupContent,
+    MarkupKind, TextEdit,
 };
 use nu_cli::{NuCompleter, SuggestionKind};
 use nu_protocol::{
     engine::{CommandType, Stack},
-    Span,
+    PositionalArg, Span, SyntaxShape,
 };
 
 impl LanguageServer {
@@ -28,22 +29,15 @@ impl LanguageServer {
                 .and_then(|s| s.chars().next())
                 .is_some_and(|c| c.is_whitespace() || "|(){}[]<>,:;".contains(c));
 
-        let (results, engine_state) = if need_fallback {
-            let engine_state = Arc::new(self.initial_engine_state.clone());
-            let completer = NuCompleter::new(engine_state.clone(), Arc::new(Stack::new()));
-            (
-                completer.fetch_completions_at(&file_text[..location], location),
-                engine_state,
-            )
+        self.need_parse |= need_fallback;
+        let engine_state = Arc::new(self.new_engine_state(Some(&path_uri)));
+        let completer = NuCompleter::new(engine_state.clone(), Arc::new(Stack::new()));
+        let results = if need_fallback {
+            completer.fetch_completions_at(&file_text[..location], location)
         } else {
-            let engine_state = Arc::new(self.new_engine_state());
-            let completer = NuCompleter::new(engine_state.clone(), Arc::new(Stack::new()));
             let file_path = uri_to_path(&path_uri);
             let filename = file_path.to_str()?;
-            (
-                completer.fetch_completions_within_file(filename, location, &file_text),
-                engine_state,
-            )
+            completer.fetch_completions_within_file(filename, location, &file_text)
         };
 
         let docs = self.docs.lock().ok()?;
@@ -52,29 +46,71 @@ impl LanguageServer {
             results
                 .into_iter()
                 .map(|r| {
-                    let decl_id = r.kind.clone().and_then(|kind| {
+                    let decl_id = r.kind.as_ref().and_then(|kind| {
                         matches!(kind, SuggestionKind::Command(_))
                             .then_some(engine_state.find_decl(r.suggestion.value.as_bytes(), &[])?)
                     });
 
-                    let mut label_value = r.suggestion.value;
-                    if r.suggestion.append_whitespace {
-                        label_value.push(' ');
+                    let mut snippet_text = r.suggestion.value.clone();
+                    let mut doc_string = r.suggestion.extra.map(|ex| ex.join("\n"));
+                    let mut insert_text_format = None;
+                    let mut idx = 1;
+                    // use snippet as `insert_text_format` for command argument completion
+                    if let Some(decl_id) = decl_id {
+                        let cmd = engine_state.get_decl(decl_id);
+                        doc_string = Some(Self::get_decl_description(cmd, true));
+                        insert_text_format = Some(InsertTextFormat::SNIPPET);
+                        let signature = cmd.signature();
+                        // add curly brackets around block arguments
+                        let block_wrapper = |arg: &PositionalArg, text: String| -> String {
+                            if matches!(arg.shape, SyntaxShape::Block | SyntaxShape::MatchBlock) {
+                                format!("{{ {text} }}")
+                            } else {
+                                text
+                            }
+                        };
+
+                        for required in signature.required_positional {
+                            snippet_text.push(' ');
+                            snippet_text.push_str(
+                                block_wrapper(&required, format!("${{{}:{}}}", idx, required.name))
+                                    .as_str(),
+                            );
+                            idx += 1;
+                        }
+                        for optional in signature.optional_positional {
+                            snippet_text.push(' ');
+                            snippet_text.push_str(
+                                block_wrapper(
+                                    &optional,
+                                    format!("${{{}:{}?}}", idx, optional.name),
+                                )
+                                .as_str(),
+                            );
+                            idx += 1;
+                        }
+                        if let Some(rest) = signature.rest_positional {
+                            snippet_text
+                                .push_str(format!(" ${{{}:...{}}}", idx, rest.name).as_str());
+                            idx += 1;
+                        }
+                    }
+                    // no extra space for a command with args expanded in the snippet
+                    if idx == 1 && r.suggestion.append_whitespace {
+                        snippet_text.push(' ');
                     }
 
                     let span = r.suggestion.span;
-                    let range = span_to_range(&Span::new(span.start, span.end), file, 0);
-
                     let text_edit = Some(CompletionTextEdit::Edit(TextEdit {
-                        range,
-                        new_text: label_value.clone(),
+                        range: span_to_range(&Span::new(span.start, span.end), file, 0),
+                        new_text: snippet_text,
                     }));
 
                     CompletionItem {
-                        label: label_value,
+                        label: r.suggestion.value,
                         label_details: r
                             .kind
-                            .clone()
+                            .as_ref()
                             .map(|kind| match kind {
                                 SuggestionKind::Value(t) => t.to_string(),
                                 SuggestionKind::Command(cmd) => cmd.to_string(),
@@ -89,21 +125,15 @@ impl LanguageServer {
                                 description: Some(s),
                             }),
                         detail: r.suggestion.description,
-                        documentation: r
-                            .suggestion
-                            .extra
-                            .map(|ex| ex.join("\n"))
-                            .or(decl_id.map(|decl_id| {
-                                Self::get_decl_description(engine_state.get_decl(decl_id), true)
-                            }))
-                            .map(|value| {
-                                Documentation::MarkupContent(MarkupContent {
-                                    kind: MarkupKind::Markdown,
-                                    value,
-                                })
-                            }),
+                        documentation: doc_string.map(|value| {
+                            Documentation::MarkupContent(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value,
+                            })
+                        }),
                         kind: Self::lsp_completion_item_kind(r.kind),
                         text_edit,
+                        insert_text_format,
                         ..Default::default()
                     }
                 })
@@ -230,13 +260,13 @@ mod tests {
             actual: result_from_message(resp),
             expected: serde_json::json!([
                 // defined after the cursor
-                { "label": "config n foo bar ", "detail": detail_str, "kind": 2 },
+                { "label": "config n foo bar", "detail": detail_str, "kind": 2 },
                 {
-                    "label": "config nu ",
+                    "label": "config nu",
                     "detail": "Edit nu configurations.",
                     "textEdit": { "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 8 }, },
                         "newText": "config nu "
-                    }
+                    },
                 },
             ])
         );
@@ -245,7 +275,7 @@ mod tests {
         let resp = send_complete_request(&client_connection, script.clone(), 1, 18);
         assert!(result_from_message(resp).as_array().unwrap().contains(
             &serde_json::json!({
-                "label": "-s ",
+                "label": "-s",
                 "detail": "test flag",
                 "labelDetails": { "description": "flag" },
                 "textEdit": { "range": { "start": { "line": 1, "character": 17 }, "end": { "line": 1, "character": 18 }, },
@@ -259,7 +289,7 @@ mod tests {
         let resp = send_complete_request(&client_connection, script.clone(), 2, 22);
         assert!(result_from_message(resp).as_array().unwrap().contains(
             &serde_json::json!({
-                "label": "--long ",
+                "label": "--long",
                 "detail": "test flag",
                 "labelDetails": { "description": "flag" },
                 "textEdit": { "range": { "start": { "line": 2, "character": 19 }, "end": { "line": 2, "character": 22 }, },
@@ -273,10 +303,10 @@ mod tests {
         let resp = send_complete_request(&client_connection, script.clone(), 2, 18);
         assert!(result_from_message(resp).as_array().unwrap().contains(
             &serde_json::json!({
-                "label": "LICENSE",
+                "label": "command.nu",
                 "labelDetails": { "description": "" },
                 "textEdit": { "range": { "start": { "line": 2, "character": 17 }, "end": { "line": 2, "character": 18 }, },
-                    "newText": "LICENSE"
+                    "newText": "command.nu"
                 },
                 "kind": 17
             })
@@ -286,7 +316,7 @@ mod tests {
         let resp = send_complete_request(&client_connection, script, 10, 34);
         assert!(result_from_message(resp).as_array().unwrap().contains(
             &serde_json::json!({
-                "label": "-g ",
+                "label": "-g",
                 "detail": "count indexes and split using grapheme clusters (all visible chars have length 1)",
                 "labelDetails": { "description": "flag" },
                 "textEdit": { "range": { "start": { "line": 10, "character": 33 }, "end": { "line": 10, "character": 34 }, },
@@ -314,13 +344,14 @@ mod tests {
             actual: result_from_message(resp),
             expected: serde_json::json!([
                 {
-                    "label": "alias ",
+                    "label": "alias",
                     "labelDetails": { "description": "keyword" },
                     "detail": "Alias a command (with optional flags) to a new name.",
                     "textEdit": {
                         "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 }, },
-                        "newText": "alias "
+                        "newText": "alias ${1:name} ${2:initial_value}"
                     },
+                    "insertTextFormat": 2,
                     "kind": 14
                 }
             ])
@@ -331,13 +362,14 @@ mod tests {
             actual: result_from_message(resp),
             expected: serde_json::json!([
                 {
-                    "label": "alias ",
+                    "label": "alias",
                     "labelDetails": { "description": "keyword" },
                     "detail": "Alias a command (with optional flags) to a new name.",
                     "textEdit": {
                         "range": { "start": { "line": 3, "character": 2 }, "end": { "line": 3, "character": 2 }, },
-                        "newText": "alias "
+                        "newText": "alias ${1:name} ${2:initial_value}"
                     },
+                    "insertTextFormat": 2,
                     "kind": 14
                 }
             ])
@@ -346,10 +378,10 @@ mod tests {
         let resp = send_complete_request(&client_connection, script, 5, 4);
         assert!(result_from_message(resp).as_array().unwrap().contains(
             &serde_json::json!({
-                "label": "LICENSE",
+                "label": "cell_path.nu",
                 "labelDetails": { "description": "" },
                 "textEdit": { "range": { "start": { "line": 5, "character": 3 }, "end": { "line": 5, "character": 4 }, },
-                    "newText": "LICENSE"
+                    "newText": "cell_path.nu"
                 },
                 "kind": 17
             })
@@ -373,13 +405,14 @@ mod tests {
             actual: result_from_message(resp),
             expected: serde_json::json!([
                 {
-                    "label": "str trim ",
+                    "label": "str trim",
                     "labelDetails": { "description": "built-in" },
                     "detail": "Trim whitespace or specific character.",
                     "textEdit": {
                         "range": { "start": { "line": 0, "character": 8 }, "end": { "line": 0, "character": 13 }, },
-                        "newText": "str trim "
+                        "newText": "str trim ${1:...rest}"
                     },
+                    "insertTextFormat": 2,
                     "kind": 3
                 }
             ])
@@ -403,7 +436,7 @@ mod tests {
             actual: result_from_message(resp),
             expected: serde_json::json!([
                 {
-                    "label": "overlay ",
+                    "label": "overlay",
                     "labelDetails": { "description": "keyword" },
                     "textEdit": {
                         "newText": "overlay ",
@@ -492,12 +525,12 @@ mod tests {
             actual: result_from_message(resp),
             expected: serde_json::json!([
                 {
-                    "label": "alias ",
+                    "label": "alias",
                     "labelDetails": { "description": "keyword" },
                     "detail": "Alias a command (with optional flags) to a new name.",
                     "textEdit": {
                         "range": { "start": { "line": 0, "character": 5 }, "end": { "line": 0, "character": 5 }, },
-                        "newText": "alias "
+                        "newText": "alias ${1:name} ${2:initial_value}"
                     },
                     "kind": 14
                 },
@@ -522,7 +555,7 @@ mod tests {
             actual: result_from_message(resp),
             expected: serde_json::json!([
                 {
-                    "label": "!= ",
+                    "label": "!=",
                     "labelDetails": { "description": "operator" },
                     "textEdit": {
                         "newText": "!= ",
@@ -538,13 +571,105 @@ mod tests {
             actual: result_from_message(resp),
             expected: serde_json::json!([
                 {
-                    "label": "not-has ",
+                    "label": "not-has",
                     "labelDetails": { "description": "operator" },
                     "textEdit": {
                         "newText": "not-has ",
                         "range": { "start": { "character": 10, "line": 7 }, "end": { "character": 15, "line": 7 } }
                     },
                     "kind": 24 // operator kind
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn complete_use_arguments() {
+        let (client_connection, _recv) = initialize_language_server(None, None);
+
+        let mut script = fixtures();
+        script.push("lsp");
+        script.push("completion");
+        script.push("use.nu");
+        let script = path_to_uri(&script);
+
+        open_unchecked(&client_connection, script.clone());
+        let resp = send_complete_request(&client_connection, script.clone(), 4, 17);
+        assert_json_include!(
+            actual: result_from_message(resp),
+            expected: serde_json::json!([
+                {
+                    "label": "std-rfc",
+                    "labelDetails": { "description": "module" },
+                    "textEdit": {
+                        "newText": "std-rfc",
+                        "range": { "start": { "character": 11, "line": 4 }, "end": { "character": 17, "line": 4 } }
+                    },
+                    "kind": 9 // module kind
+                }
+            ])
+        );
+
+        let resp = send_complete_request(&client_connection, script.clone(), 5, 22);
+        assert_json_include!(
+            actual: result_from_message(resp),
+            expected: serde_json::json!([
+                {
+                    "label": "clip",
+                    "labelDetails": { "description": "module" },
+                    "textEdit": {
+                        "newText": "clip",
+                        "range": { "start": { "character": 19, "line": 5 }, "end": { "character": 23, "line": 5 } }
+                    },
+                    "kind": 9 // module kind
+                }
+            ])
+        );
+
+        let resp = send_complete_request(&client_connection, script.clone(), 5, 35);
+        assert_json_include!(
+            actual: result_from_message(resp),
+            expected: serde_json::json!([
+                {
+                    "label": "paste",
+                    "labelDetails": { "description": "custom" },
+                    "textEdit": {
+                        "newText": "paste",
+                        "range": { "start": { "character": 32, "line": 5 }, "end": { "character": 37, "line": 5 } }
+                    },
+                    "kind": 2
+                }
+            ])
+        );
+
+        let resp = send_complete_request(&client_connection, script.clone(), 6, 14);
+        assert_json_include!(
+            actual: result_from_message(resp),
+            expected: serde_json::json!([
+                {
+                    "label": "null_device",
+                    "labelDetails": { "description": "variable" },
+                    "textEdit": {
+                        "newText": "null_device",
+                        "range": { "start": { "character": 8, "line": 6 }, "end": { "character": 14, "line": 6 } }
+                    },
+                    "kind": 6 // variable kind
+                }
+            ])
+        );
+
+        let resp = send_complete_request(&client_connection, script, 7, 13);
+        assert_json_include!(
+            actual: result_from_message(resp),
+            expected: serde_json::json!([
+                {
+                    "label": "foo",
+                    "labelDetails": { "description": "variable" },
+                    "textEdit": {
+                        "newText": "foo",
+                        "range": { "start": { "character": 11, "line": 7 }, "end": { "character": 14, "line": 7 } }
+                    },
+                    "kind": 6 // variable kind
                 }
             ])
         );
