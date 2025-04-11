@@ -205,6 +205,13 @@ pub fn insert_value(
     column_values: &mut ColumnMap,
     maybe_schema: &Option<NuSchema>,
 ) -> Result<(), ShellError> {
+    // If we have a schema but a key is not provided, do not create that column
+    if let Some(schema) = maybe_schema {
+        if !schema.schema.contains(&key) {
+            return Ok(());
+        }
+    }
+
     let col_val = match column_values.entry(key.clone()) {
         Entry::Vacant(entry) => entry.insert(TypedColumn::new_empty(key.clone())),
         Entry::Occupied(entry) => entry.into_mut(),
@@ -215,28 +222,22 @@ pub fn insert_value(
         if let Some(field) = schema.schema.get_field(&key) {
             col_val.column_type = Some(field.dtype().clone());
             col_val.values.push(value);
-            Ok(())
-        } else {
-            Err(ShellError::GenericError {
-                error: format!("Schema does not contain column: {key}"),
-                msg: "".into(),
-                span: Some(value.span()),
-                help: None,
-                inner: vec![],
-            })
+            return Ok(());
         }
-    } else {
-        let current_data_type = value_to_data_type(&value);
-        if col_val.column_type.is_none() {
-            col_val.column_type = value_to_data_type(&value);
-        } else if let Some(current_data_type) = current_data_type {
-            if col_val.column_type.as_ref() != Some(&current_data_type) {
-                col_val.column_type = Some(DataType::Object("Value", None));
-            }
-        }
-        col_val.values.push(value);
-        Ok(())
     }
+
+    // If we do not have a schema, use defaults specified in `value_to_data_type`
+    let current_data_type = value_to_data_type(&value);
+    if col_val.column_type.is_none() {
+        col_val.column_type = value_to_data_type(&value);
+    } else if let Some(current_data_type) = current_data_type {
+        if col_val.column_type.as_ref() != Some(&current_data_type) {
+            col_val.column_type = Some(DataType::Object("Value", None));
+        }
+    }
+    col_val.values.push(value);
+
+    Ok(())
 }
 
 fn value_to_data_type(value: &Value) -> Option<DataType> {
@@ -245,7 +246,10 @@ fn value_to_data_type(value: &Value) -> Option<DataType> {
         Value::Float { .. } => Some(DataType::Float64),
         Value::String { .. } => Some(DataType::String),
         Value::Bool { .. } => Some(DataType::Boolean),
-        Value::Date { .. } => Some(DataType::Date),
+        Value::Date { .. } => Some(DataType::Datetime(
+            TimeUnit::Nanoseconds,
+            Some(PlSmallStr::from_static("UTC")),
+        )),
         Value::Duration { .. } => Some(DataType::Duration(TimeUnit::Nanoseconds)),
         Value::Filesize { .. } => Some(DataType::Int64),
         Value::Binary { .. } => Some(DataType::Binary),
@@ -447,24 +451,28 @@ fn typed_column_to_series(name: PlSmallStr, column: TypedColumn) -> Result<Serie
                 .values
                 .iter()
                 .map(|v| {
-                    if let Value::Date { val, .. } = &v {
-                        // If there is a timezone specified, make sure
-                        // the value is converted to it
-                        Ok(maybe_tz
-                            .as_ref()
-                            .map(|tz| tz.parse::<Tz>().map(|tz| val.with_timezone(&tz)))
-                            .transpose()
-                            .map_err(|e| ShellError::GenericError {
-                                error: "Error parsing timezone".into(),
-                                msg: "".into(),
-                                span: None,
-                                help: Some(e.to_string()),
-                                inner: vec![],
-                            })?
-                            .and_then(|dt| dt.timestamp_nanos_opt())
-                            .map(|nanos| nanos_from_timeunit(nanos, *tu)))
-                    } else {
-                        Ok(None)
+                    match (maybe_tz, &v) {
+                        (Some(tz), Value::Date { val, .. }) => {
+                            // If there is a timezone specified, make sure
+                            // the value is converted to it
+                            Ok(tz
+                                .parse::<Tz>()
+                                .map(|tz| val.with_timezone(&tz))
+                                .map_err(|e| ShellError::GenericError {
+                                    error: "Error parsing timezone".into(),
+                                    msg: "".into(),
+                                    span: None,
+                                    help: Some(e.to_string()),
+                                    inner: vec![],
+                                })?
+                                .timestamp_nanos_opt()
+                                .map(|nanos| nanos_from_timeunit(nanos, *tu)))
+                        }
+                        (None, Value::Date { val, .. }) => Ok(val
+                            .timestamp_nanos_opt()
+                            .map(|nanos| nanos_from_timeunit(nanos, *tu))),
+
+                        _ => Ok(None),
                     }
                 })
                 .collect::<Result<Vec<Option<i64>>, ShellError>>()?;
